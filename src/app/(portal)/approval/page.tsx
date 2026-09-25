@@ -45,7 +45,7 @@ import {
 import { Card } from '@/components/ui/card';
 import { useAuth } from '@/lib/auth/auth-context';
 import { usePendingDepots, usePendingQuotations, IN_CHAIN_STATUSES } from '@/features/approvals';
-import { STEP_LABELS, useAgreementRequests } from '@/features/promotions';
+import { AWAITING_SIGNATURE, BUSINESS_TYPE_LABELS, usePromotions } from '@/features/promotions';
 
 /** How many rows each category previews before deferring to its own screen. */
 const PREVIEW_ROWS = 5;
@@ -154,13 +154,16 @@ export default function ApprovalHubPage() {
 
   const quotations = usePendingQuotations(PREVIEW_ROWS, canSales);
   const depots = usePendingDepots(PREVIEW_ROWS, canDepots);
-  const agreements = useAgreementRequests({ pageSize: AGREEMENT_SCAN }, canSales);
+  const promotions = usePromotions({ pageSize: AGREEMENT_SCAN });
 
-  // "In the chain" is four statuses and the endpoint filters by one, so this is computed
-  // over the page we have rather than asked for as a total. See the module note.
+  // "Awaiting a signature" is two statuses and the endpoint filters by one, so this is
+  // computed over the page we have rather than asked for as a total.
   const inChain = useMemo(
-    () => (agreements.data?.items ?? []).filter((r) => (IN_CHAIN_STATUSES as readonly string[]).includes(r.status)),
-    [agreements.data]
+    () =>
+      (promotions.data?.items ?? []).filter((row) =>
+        (AWAITING_SIGNATURE as readonly string[]).includes(row.status)
+      ),
+    [promotions.data]
   );
 
   const total =
@@ -171,7 +174,7 @@ export default function ApprovalHubPage() {
   const visibleCount = (canSales ? 2 : 0) + (canDepots ? 1 : 0);
 
   const anyLoading =
-    (canSales && (quotations.isLoading || agreements.isLoading)) || (canDepots && depots.isLoading);
+    (canSales && (quotations.isLoading || promotions.isLoading)) || (canDepots && depots.isLoading);
 
   return (
     <div className="p-6 md:p-8 max-w-[1440px] mx-auto pb-24 space-y-6">
@@ -288,42 +291,36 @@ export default function ApprovalHubPage() {
           subtitle="Depot agreements moving through four signatures"
           icon={BadgePercent}
           tone="bg-amber-50 text-amber-600"
-          count={agreements.isLoading ? null : inChain.length}
-          loading={agreements.isLoading}
+          count={promotions.isLoading ? null : inChain.length}
+          loading={promotions.isLoading}
           href="/promotions"
         >
           <Rows
-            loading={agreements.isLoading}
-            error={agreements.error}
+            loading={promotions.isLoading}
+            error={promotions.error}
             empty={inChain.length === 0}
-            emptyLabel="No agreements in the chain"
+            emptyLabel="No promotions awaiting a signature"
           >
-            {inChain.slice(0, PREVIEW_ROWS).map((r) => (
+            {inChain.slice(0, PREVIEW_ROWS).map((row) => (
               <Link
-                key={r.id}
-                href="/promotions"
+                key={row.id}
+                href={`/promotions/${row.id}`}
                 className="block px-5 py-3 hover:bg-gray-50/70 transition-colors"
               >
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-[12.5px] font-600 text-gray-900 truncate" style={{ fontWeight: 600 }}>
-                    {r.requestNumber}
-                    {r.revision > 1 && <span className="ml-1 text-[10px] text-gray-400">rev {r.revision}</span>}
+                    {row.code}
+                    {row.versionNumber != null && (
+                      <span className="ml-1 text-[10px] text-gray-400">v{row.versionNumber}</span>
+                    )}
                   </span>
-                  {r.currentStep != null && (
-                    <span className="text-[10px] text-gray-400 flex-shrink-0">
-                      step {r.currentStep}/4
-                    </span>
-                  )}
+                  <span className="text-[10px] text-gray-400 flex-shrink-0">
+                    {row.status === 'UnderFinanceReview' ? 'finance' : 'commercial'}
+                  </span>
                 </div>
                 <p className="text-[11px] text-gray-400 truncate">
-                  {r.customerName || r.customerId} ·{' '}
-                  {r.currentStep != null ? `with ${STEP_LABELS[r.currentStep] ?? 'an approver'}` : 'unassigned'}
+                  {row.name} · {BUSINESS_TYPE_LABELS[row.businessType] ?? row.businessType}
                 </p>
-                {r.slaDueAt && (
-                  <p className="text-[10px] text-gray-400 mt-0.5 flex items-center gap-1">
-                    <Clock size={9} /> due {format(new Date(r.slaDueAt), 'd MMM HH:mm')}
-                  </p>
-                )}
               </Link>
             ))}
           </Rows>

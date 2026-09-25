@@ -29,19 +29,11 @@ next-env.d.ts
 .env
 .env.*
 !.env.example
-env-*.txt
-*.env
 *.pem
-*.key
-*.p12
-*.pfx
-*.crt
-secrets/
 
 ## Version control and IDE state.
 .git
 .gitignore
-.github
 .vscode
 .idea
 .DS_Store
@@ -63,9 +55,7 @@ Dockerfile
 Dockerfile.*
 .dockerignore
 compose*.yml
-compose*.yaml
 docker-compose*.yml
-docker-compose*.yaml
 
 ## Logs.
 npm-debug.log*

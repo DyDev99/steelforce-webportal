@@ -42,6 +42,15 @@ export const PROVINCE_CENTERS: Record<string, LatLng> = {
   'Kampong Speu': { lat: 11.4531, lng: 104.5209 },
 };
 
+/**
+ * Whether a point can be drawn. The adapters give an unpinned customer or rep NaN
+ * coordinates rather than (0, 0); a single NaN handed to Google Maps poisons
+ * `fitBounds` and blanks the whole map, so every map filters through this first.
+ */
+export function hasCoordinates<T extends LatLng>(p: T | null | undefined): p is T {
+  return !!p && Number.isFinite(p.lat) && Number.isFinite(p.lng);
+}
+
 export function boundsOf(points: LatLng[], padRatio = 0.12): Bounds {
   if (points.length === 0) {
     return { minLat: 11.48, maxLat: 11.63, minLng: 104.83, maxLng: 105.0 };

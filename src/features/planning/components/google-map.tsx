@@ -9,7 +9,7 @@ import {
   repDotIcon,
   stopPinIcon,
 } from '@/features/planning/lib/google-maps';
-import { PHNOM_PENH } from '@/features/planning/lib/geo';
+import { PHNOM_PENH, hasCoordinates } from '@/features/planning/lib/geo';
 import { PRIORITY_TONE, STATUS_TONE, repColor } from '@/features/planning/lib/tokens';
 import type { StopView } from '@/features/planning/types';
 import { StopPopupCard } from './stop-popup-card';
@@ -52,7 +52,19 @@ export function GoogleStopMap({
   const [popupMounted, setPopupMounted] = useState(false);
   const { resolvedTheme } = useTheme();
 
-  const visible = useMemo(() => stops.slice(0, maxMarkers), [stops, maxMarkers]);
+  // Everything drawn goes through hasCoordinates: one unpinned customer or rep
+  // (NaN coordinates) would otherwise blank the entire map via fitBounds.
+  const visible = useMemo(
+    () => stops.filter((s) => hasCoordinates(s.customer)).slice(0, maxMarkers),
+    [stops, maxMarkers]
+  );
+  const plottedDepots = useMemo(() => depots.filter(hasCoordinates), [depots]);
+  const plottedReps = useMemo(() => reps.filter(hasCoordinates), [reps]);
+  const plottedRoute = useMemo(
+    () => routeStops.filter((s) => hasCoordinates(s.customer)),
+    [routeStops]
+  );
+  const origin = hasCoordinates(routeDepot) ? routeDepot : null;
   const routeIndex = useMemo(() => {
     const m = new Map<string, number>();
     routeStops.forEach((s, i) => m.set(s.id, i + 1));
@@ -217,7 +229,7 @@ export function GoogleStopMap({
     const layer = depotMarkers.current;
     layer.forEach((m) => m.setMap(null));
     layer.length = 0;
-    depots.forEach((d) => {
+    plottedDepots.forEach((d) => {
       layer.push(
         new google.maps.Marker({
           map: mapRef.current,
@@ -232,7 +244,7 @@ export function GoogleStopMap({
         })
       );
     });
-  }, [ready, depots, resolvedTheme]);
+  }, [ready, plottedDepots, resolvedTheme]);
 
   // ── Live rep positions ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -241,7 +253,7 @@ export function GoogleStopMap({
     const layer = repOverlays.current;
     layer.forEach((m) => m.setMap(null));
     layer.length = 0;
-    reps.forEach((rep) => {
+    plottedReps.forEach((rep) => {
       const color = repColor(rep.avatarHue);
       const halo = new google.maps.Circle({
         map: mapRef.current,
@@ -267,7 +279,7 @@ export function GoogleStopMap({
       });
       layer.push(halo, dot);
     });
-  }, [ready, reps]);
+  }, [ready, plottedReps]);
 
   // ── Route polyline ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -278,12 +290,12 @@ export function GoogleStopMap({
     layer.forEach((p) => p.setMap(null));
     layer.length = 0;
 
-    if (routeStops.length === 0) return;
+    if (plottedRoute.length === 0) return;
 
     const path = [
-      ...(routeDepot ? [{ lat: routeDepot.lat, lng: routeDepot.lng }] : []),
-      ...routeStops.map((s) => ({ lat: s.customer.lat, lng: s.customer.lng })),
-      ...(routeDepot ? [{ lat: routeDepot.lat, lng: routeDepot.lng }] : []),
+      ...(origin ? [{ lat: origin.lat, lng: origin.lng }] : []),
+      ...plottedRoute.map((s) => ({ lat: s.customer.lat, lng: s.customer.lng })),
+      ...(origin ? [{ lat: origin.lat, lng: origin.lng }] : []),
     ];
 
     const base = new google.maps.Polyline({
@@ -326,23 +338,23 @@ export function GoogleStopMap({
     }, 90);
 
     layer.push(base, dashed);
-  }, [ready, routeStops, routeDepot, routeColor]);
+  }, [ready, plottedRoute, origin, routeColor]);
 
   // ── Viewport fit ───────────────────────────────────────────────────────────
   const fitKey = useMemo(
-    () => (routeStops.length ? routeStops.map((s) => s.id).join(',') : visible.map((s) => s.id).join(',')),
-    [routeStops, visible]
+    () => (plottedRoute.length ? plottedRoute.map((s) => s.id).join(',') : visible.map((s) => s.id).join(',')),
+    [plottedRoute, visible]
   );
 
   useEffect(() => {
     if (!ready) return;
     const google = googleRef.current;
-    const points = routeStops.length ? routeStops : visible;
+    const points = plottedRoute.length ? plottedRoute : visible;
     if (points.length === 0) return;
     const bounds = new google.maps.LatLngBounds();
     points.forEach((s) => bounds.extend({ lat: s.customer.lat, lng: s.customer.lng }));
-    if (routeDepot) bounds.extend({ lat: routeDepot.lat, lng: routeDepot.lng });
-    else depots.forEach((d) => bounds.extend({ lat: d.lat, lng: d.lng }));
+    if (origin) bounds.extend({ lat: origin.lat, lng: origin.lng });
+    else plottedDepots.forEach((d) => bounds.extend({ lat: d.lat, lng: d.lng }));
     mapRef.current.fitBounds(bounds, 64);
     // Only refit when the set of plotted stops actually changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -369,7 +381,7 @@ export function GoogleStopMap({
   const refit = () => {
     if (!ready) return;
     const google = googleRef.current;
-    const points = routeStops.length ? routeStops : visible;
+    const points = plottedRoute.length ? plottedRoute : visible;
     if (points.length === 0) return;
     const bounds = new google.maps.LatLngBounds();
     points.forEach((s) => bounds.extend({ lat: s.customer.lat, lng: s.customer.lng }));

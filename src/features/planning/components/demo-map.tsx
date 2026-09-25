@@ -1,7 +1,7 @@
 'use client';
 
 import { AREA_LABELS, HIGHWAYS, LAKES, RIVERS, STREETS } from '@/features/planning/lib/map-geometry';
-import { boundsOf, project, type Bounds } from '@/features/planning/lib/geo';
+import { boundsOf, hasCoordinates, project, type Bounds } from '@/features/planning/lib/geo';
 import { customerTypeIcon, PRIORITY_TONE, STATUS_TONE, repColor } from '@/features/planning/lib/tokens';
 import { EASE } from '@/lib/utilities/motion';
 import type { LatLng, StopView } from '@/features/planning/types';
@@ -25,11 +25,11 @@ const ZOOM_MAX = 4;
 
 export function DemoMap({
   stops,
-  depots = [],
-  reps = [],
-  routeStops = [],
+  depots: allDepots = [],
+  reps: allReps = [],
+  routeStops: allRouteStops = [],
   stopIcon = 'customerType',
-  routeDepot = null,
+  routeDepot: rawRouteDepot = null,
   routeColor = '#004A98',
   selectedStopId = null,
   onSelectStop,
@@ -47,7 +47,19 @@ export function DemoMap({
   const [showReps, setShowReps] = useState(true);
   const dragOrigin = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
 
-  const visible = useMemo(() => stops.slice(0, maxMarkers), [stops, maxMarkers]);
+  // Unpinned customers and reps carry NaN coordinates; they cannot be projected,
+  // and an all-NaN set would collapse the bounds to Infinity.
+  const visible = useMemo(
+    () => stops.filter((s) => hasCoordinates(s.customer)).slice(0, maxMarkers),
+    [stops, maxMarkers]
+  );
+  const depots = useMemo(() => allDepots.filter(hasCoordinates), [allDepots]);
+  const reps = useMemo(() => allReps.filter(hasCoordinates), [allReps]);
+  const routeStops = useMemo(
+    () => allRouteStops.filter((s) => hasCoordinates(s.customer)),
+    [allRouteStops]
+  );
+  const routeDepot = hasCoordinates(rawRouteDepot) ? rawRouteDepot : null;
 
   const bounds: Bounds = useMemo(() => {
     const pts: LatLng[] = [
@@ -211,7 +223,7 @@ export function DemoMap({
             const tone = colorBy === 'status' ? STATUS_TONE[stop.status] : PRIORITY_TONE[stop.priority];
             const inRoute = routeIds.has(stop.id);
             const dimmed = routeStops.length > 0 && !inRoute;
-            const seq = inRoute ? routeStops.findIndex((s) => s.id === stop.id) + 1 : undefined;
+            const seq = inRoute ? allRouteStops.findIndex((s) => s.id === stop.id) + 1 : undefined;
             return (
               <div key={stop.id} style={{ opacity: dimmed ? 0.32 : 1 }}>
                 <MapMarker

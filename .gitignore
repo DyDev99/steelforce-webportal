@@ -25,31 +25,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# local env files - every variant except the committed template.
-# `.env*` also catches backups such as .env.bak.planning.
-.env*
-!.env.example
-# Ad-hoc env dumps kept outside the .env naming convention.
-env-*.txt
-*.env
-
-# keys, certificates and credentials
-*.key
-*.p12
-*.pfx
-*.crt
-*.cer
-*.der
-*.jks
-*.keystore
-id_rsa*
-id_ed25519*
-*service-account*.json
-*firebase-adminsdk*.json
-secrets/
-
-# generated knowledge-graph output (graphify) - regenerable, machine-local
-graphify-out/
+# local env files
+.env
+.env*.local
 
 # vercel
 .vercel

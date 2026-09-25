@@ -1,5 +1,6 @@
 /**
- * Depot agreements: the approval chain, the terms it produces and the SAP work they need.
+ * Promotions and discounts: the rule engine behind every discount the business gives.
  */
 export * from './api';
 export * from './hooks';
+export * from './presentation';

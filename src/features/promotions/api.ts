@@ -1,24 +1,31 @@
 /**
- * The promotions module's HTTP boundary — `AgreementsController`.
+ * Promotions and discounts — the HTTP boundary for `PromotionsController`.
  *
- * ## What this feature actually is
+ * ## What this feature is
  *
- * It is **not** a promotions builder. There are no campaigns, no free-goods ladders and
- * no invoice schemes in this platform. What exists is a *depot agreement* pipeline:
+ * A **rule engine**. Every discount the business gives is a promotion row rather than
+ * code: conditions, a reward, validity, priority, stacking and a SAP mapping. Commercial
+ * and Finance author them and take them through a two-stage approval before they go live.
  *
- * 1. A request is raised against a depot carrying discount lines per category.
- * 2. Four people sign it in order — Sales Support, Regional Sales Manager, Consultant,
- *    Commercial Director — each with their own permission and their own allowed
- *    outcomes. The requester never signs, and one person holding two of those
- *    permissions still signs at most once per revision.
- * 3. The fourth approval snapshots the lines into immutable **terms** and queues **SAP
- *    condition work**.
- * 4. A term only becomes chargeable once somebody closes that SAP task with the
- *    condition record number SAP actually holds.
+ * This replaced the depot-agreement pipeline — request, four signatures, immutable term,
+ * SAP condition task. Those endpoints no longer exist.
  *
- * **Approval does not make a rate chargeable** — step 4 and step 3 of that list are
- * different events, often days apart, and conflating them on screen is how a depot ends
- * up not receiving a discount four people signed.
+ * ## The lifecycle, and why the screen has to show two things at once
+ *
+ * A promotion is a container; its content lives on **versions**. Editing a live discount
+ * creates a new version rather than changing what was approved, so a promotion can have a
+ * live version and an open one being worked on at the same time. That is why the list
+ * carries both `status` (the open version's) and `liveVersionNumber` — showing only one
+ * tells somebody a promotion is Draft when customers are being charged under it today.
+ *
+ * `Draft → UnderCommercialReview → UnderFinanceReview → Approved → Live`, with
+ * `Rejected`, `Cancelled` and `Withdrawn` as exits.
+ *
+ * ## Approval is not activation
+ *
+ * Finance approving a version does not price anything. `activate` does, and it is a
+ * separate call and a separate permission. Conflating them on screen is how a discount
+ * nobody switched on is reported as being given.
  */
 import { z } from 'zod';
 import { apiClient } from '@/infrastructure/api/client';
@@ -26,378 +33,229 @@ import { unwrapData, unwrapList, unwrapPage } from '@/infrastructure/api/envelop
 import type { ApiQuery } from '@/infrastructure/api/types';
 
 const API_V1 = '/api/v1';
-const ADMIN = `${API_V1}/admin`;
+const PROMOTIONS = `${API_V1}/promotions`;
 
-/**
- * Where a request sits in the chain.
- *
- * `catch` on every enum: a backend that adds a state should grey one row, not blank the
- * whole inbox.
- */
-export const AgreementStatus = z
-  .enum([
-    'Draft',
-    'AwaitingPrepare',
-    'AwaitingVerify',
-    'AwaitingConsultant',
-    'AwaitingFinal',
-    'Approved',
-    'Returned',
-    'Rejected',
-    'Withdrawn',
-  ])
-  .catch('Draft');
+/** The seven ways a discount can be shaped. Mirrors the server's `businessType`. */
+export const PROMOTION_BUSINESS_TYPES = [
+  'TransportationPickupDiscount',
+  'ProductSkuDiscount',
+  'PaymentMethodDiscount',
+  'CustomerProductDiscount',
+  'QuantityTierDiscount',
+  'BuyXGetY',
+  'GeneralDiscount',
+] as const;
 
-/** A term's lifecycle. `Approved` is signed but **not yet chargeable**. */
-export const TermState = z
-  .enum(['Approved', 'Effective', 'SapMismatch', 'Superseded', 'Expired', 'Terminated'])
-  .catch('Approved');
+export type PromotionBusinessType = (typeof PROMOTION_BUSINESS_TYPES)[number];
 
-export const RebateTierSchema = z.object({
-  minAmount: z.number().nullable().optional(),
-  maxAmount: z.number().nullable().optional(),
-  percent: z.number().nullable().optional(),
-});
+/** Readable labels. The server sends the enum name; these are for people. */
+export const BUSINESS_TYPE_LABELS: Record<string, string> = {
+  TransportationPickupDiscount: 'Pickup / transport',
+  ProductSkuDiscount: 'Product (SKU)',
+  PaymentMethodDiscount: 'Payment method',
+  CustomerProductDiscount: 'Customer + product',
+  QuantityTierDiscount: 'Quantity tier',
+  BuyXGetY: 'Buy X get Y',
+  GeneralDiscount: 'General',
+};
 
-export const AgreementLineSchema = z.object({
+/** Every state a version can be in, in lifecycle order. */
+export const PROMOTION_STATUSES = [
+  'Draft',
+  'UnderCommercialReview',
+  'UnderFinanceReview',
+  'Approved',
+  'Live',
+  'Rejected',
+  'Cancelled',
+  'Withdrawn',
+  'Expired',
+] as const;
+
+/** The states that mean somebody still has to sign. Drives the approval queue. */
+export const AWAITING_SIGNATURE = ['UnderCommercialReview', 'UnderFinanceReview'] as const;
+
+export const PromotionListItemSchema = z.object({
   id: z.string(),
-  categoryCode: z.string(),
-  categoryName: z.string(),
-  entryMode: z.string(),
-  nature: z.string(),
-  percent: z.number().nullable().optional(),
-  currency: z.string(),
-  validFrom: z.string(),
+  code: z.string(),
+  name: z.string(),
+  businessType: z.string(),
+  rewardType: z.string().nullable().optional(),
+  versionNumber: z.number().nullable().optional(),
+  status: z.string(),
+  validFrom: z.string().nullable().optional(),
   validTo: z.string().nullable().optional(),
-  tiers: z.array(RebateTierSchema).default([]),
+  priority: z.number().nullable().optional(),
+  stacking: z.string().nullable().optional(),
+  sapConditionType: z.string().nullable().optional(),
+  sapStatus: z.string().nullable().optional(),
+  liveVersionNumber: z.number().nullable().optional(),
+  openVersionNumber: z.number().nullable().optional(),
+  openVersionStatus: z.string().nullable().optional(),
+  createdBy: z.string().nullable().optional(),
+  createdAt: z.string().nullable().optional(),
+  updatedAt: z.string().nullable().optional(),
 });
 
-export const TimelineEntrySchema = z.object({
-  stepOrder: z.number(),
-  label: z.string(),
-  status: z.string(),
-  actorName: z.string().nullable().optional(),
+export const PromotionConditionSchema = z.object({
+  dimension: z.string(),
+  operator: z.string(),
+  values: z.array(z.string()).default([]),
+  group: z.number().nullable().optional(),
+});
+
+export const PromotionTierSchema = z.object({
+  fromQuantity: z.number().nullable().optional(),
+  toQuantity: z.number().nullable().optional(),
+  rewardValue: z.number().nullable().optional(),
+  freeQuantity: z.number().nullable().optional(),
+});
+
+export const PromotionApprovalSchema = z.object({
+  stage: z.string().nullable().optional(),
+  outcome: z.string().nullable().optional(),
+  decidedBy: z.string().nullable().optional(),
+  decidedAt: z.string().nullable().optional(),
   comment: z.string().nullable().optional(),
-  actedAt: z.string().nullable().optional(),
-  slaDueAt: z.string().nullable().optional(),
 });
 
-export const AgreementSummarySchema = z.object({
+export const PromotionVersionSchema = z.object({
   id: z.string(),
-  requestNumber: z.string(),
-  customerId: z.string(),
-  customerName: z.string().nullable().optional(),
-  status: AgreementStatus,
-  currentStep: z.number().nullable().optional(),
-  revision: z.number().default(1),
-  linesCount: z.number().default(0),
-  slaDueAt: z.string().nullable().optional(),
-  createdAt: z.string(),
-});
-
-export const AgreementDetailSchema = AgreementSummarySchema.extend({
-  clientRequestId: z.string(),
-  remarks: z.string().nullable().optional(),
-  isEditable: z.boolean().default(false),
-  lines: z.array(AgreementLineSchema).default([]),
-  timeline: z.array(TimelineEntrySchema).default([]),
-  terms: z.array(z.string()).default([]),
-});
-
-export const AgreementTermSchema = z.object({
-  id: z.string(),
-  termNumber: z.string(),
-  customerId: z.string(),
-  customerName: z.string().nullable().optional(),
-  categoryCode: z.string(),
-  nature: z.string(),
-  percent: z.number().nullable().optional(),
-  currency: z.string(),
-  validFrom: z.string(),
-  validTo: z.string().nullable().optional(),
-  state: TermState,
-  sapConditionRecord: z.string().nullable().optional(),
-  verifiedAt: z.string().nullable().optional(),
-  sourceRequestNumber: z.string().nullable().optional(),
-  terminationReason: z.string().nullable().optional(),
-  tiers: z.array(RebateTierSchema).default([]),
-});
-
-export const SapTaskSchema = z.object({
-  id: z.string(),
-  termNumber: z.string(),
-  customerName: z.string().nullable().optional(),
-  categoryCode: z.string(),
-  percent: z.number().nullable().optional(),
-  validFrom: z.string(),
-  validTo: z.string().nullable().optional(),
-  taskType: z.string(),
+  versionNumber: z.number(),
   status: z.string(),
-  dueAt: z.string(),
-  completedAt: z.string().nullable().optional(),
-  resolutionNotes: z.string().nullable().optional(),
+  name: z.string(),
+  description: z.string().nullable().optional(),
+  validFrom: z.string().nullable().optional(),
+  validTo: z.string().nullable().optional(),
+  priority: z.number().nullable().optional(),
+  stacking: z.string().nullable().optional(),
+  rewardType: z.string().nullable().optional(),
+  rewardValue: z.number().nullable().optional(),
+  currency: z.string().nullable().optional(),
+  unit: z.string().nullable().optional(),
+  freeMaterialNumber: z.string().nullable().optional(),
+  requiresSapSync: z.boolean().nullable().optional(),
+  sapConditionType: z.string().nullable().optional(),
+  sapStatus: z.string().nullable().optional(),
+  sapConditionRecord: z.string().nullable().optional(),
+  conditions: z.array(PromotionConditionSchema).default([]),
+  tiers: z.array(PromotionTierSchema).default([]),
+  approvals: z.array(PromotionApprovalSchema).default([]),
+});
+
+export const PromotionDetailSchema = z.object({
+  id: z.string(),
+  code: z.string(),
+  businessType: z.string(),
+  liveVersionNumber: z.number().nullable().optional(),
+  openVersionNumber: z.number().nullable().optional(),
+  versions: z.array(PromotionVersionSchema).default([]),
+  createdBy: z.string().nullable().optional(),
+  createdAt: z.string().nullable().optional(),
 });
 
 export const CategoryMappingSchema = z.object({
-  id: z.string(),
-  categoryCode: z.string(),
-  sapMaterialPriceGroup: z.string(),
-  description: z.string().nullable().optional(),
-  isActive: z.boolean().default(true),
-});
-
-export const PickupRuleSchema = z.object({
-  id: z.string(),
-  name: z.string(),
-  regionCode: z.string().nullable().optional(),
   categoryCode: z.string().nullable().optional(),
-  percent: z.number().nullable().optional(),
-  validFrom: z.string(),
-  validTo: z.string().nullable().optional(),
-  isActive: z.boolean().default(true),
-  sapConditionType: z.string().nullable().optional(),
+  categoryName: z.string().nullable().optional(),
+  sapPriceGroup: z.string().nullable().optional(),
 });
 
-const AgreementPageSchema = z.object({
-  items: z.array(AgreementSummarySchema).default([]),
+const PromotionPageSchema = z.object({
+  items: z.array(PromotionListItemSchema).default([]),
   totalCount: z.number().default(0),
 });
 
-const TermPageSchema = z.object({
-  items: z.array(AgreementTermSchema).default([]),
-  totalCount: z.number().default(0),
-});
-
-export type AgreementSummaryDto = z.infer<typeof AgreementSummarySchema>;
-export type AgreementDetailDto = z.infer<typeof AgreementDetailSchema>;
-export type AgreementTermDto = z.infer<typeof AgreementTermSchema>;
-export type SapTaskDto = z.infer<typeof SapTaskSchema>;
+export type PromotionListItemDto = z.infer<typeof PromotionListItemSchema>;
+export type PromotionDetailDto = z.infer<typeof PromotionDetailSchema>;
+export type PromotionVersionDto = z.infer<typeof PromotionVersionSchema>;
+export type PromotionConditionDto = z.infer<typeof PromotionConditionSchema>;
 export type CategoryMappingDto = z.infer<typeof CategoryMappingSchema>;
-export type PickupRuleDto = z.infer<typeof PickupRuleSchema>;
-export type TimelineEntryDto = z.infer<typeof TimelineEntrySchema>;
 
-/**
- * What an approver may do, per step.
- *
- * **Configuration on the server, mirrored here only to disable buttons.** The handler
- * enforces it regardless, and it also enforces the four-eyes rule this cannot see — so
- * a button being enabled is not a promise the action will be accepted.
- *
- * Step 1 cannot reject: it checks a request is *complete*, not whether it is a good
- * idea. Steps 3 and 4 cannot return, because two people have already signed and sending
- * it back would discard both signatures.
- */
-export const STEP_OUTCOMES: Record<number, readonly AgreementOutcome[]> = {
-  1: ['forward', 'return'],
-  2: ['forward', 'return', 'reject'],
-  3: ['approve', 'reject'],
-  4: ['approve', 'reject'],
-};
-
-export type AgreementOutcome = 'forward' | 'approve' | 'return' | 'reject';
-
-/** Outcomes that require a comment. Refused server-side without one. */
-export const OUTCOMES_NEEDING_COMMENT: readonly AgreementOutcome[] = ['return', 'reject'];
-
-export const STEP_LABELS: Record<number, string> = {
-  1: 'Sales Support',
-  2: 'Regional Sales Manager',
-  3: 'Consultant',
-  4: 'Commercial Director',
-};
+/** What the create form sends. Mirrors `CreatePromotionRequest`. */
+export interface CreatePromotionInput {
+  code: string;
+  businessType: string;
+  name: string;
+  description: string;
+  validFrom: string;
+  validTo: string;
+  priority?: number;
+  stacking?: string;
+  rewardType: string;
+  rewardValue?: number | null;
+  currency?: string | null;
+  unit?: string | null;
+  requiresSapSync?: boolean;
+  conditions?: { dimension: string; operator: string; values: string[] }[];
+}
 
 export const promotionsApi = {
-  /** The approvals inbox. `step` narrows to what is waiting at one stage. */
-  listRequests: async (
-    query: { status?: string; step?: number; customerId?: string; page?: number; pageSize?: number } = {},
+  /** The catalogue, filtered. */
+  list: async (
+    query: {
+      status?: string;
+      businessType?: string;
+      sapStatus?: string;
+      search?: string;
+      page?: number;
+      pageSize?: number;
+    } = {},
     signal?: AbortSignal
   ) => {
-    const body = await apiClient.get<unknown>(`${ADMIN}/agreement-requests`, {
-      query: query as ApiQuery,
+    const body = await apiClient.get<unknown>(PROMOTIONS, {
+      query: { pageSize: 50, ...query } as ApiQuery,
       signal,
     });
 
-    return AgreementPageSchema.parse(unwrapPage(body));
+    return PromotionPageSchema.parse(unwrapPage(body));
   },
 
-  /** One request with its lines and its four-step timeline. */
-  getRequest: async (requestId: string, signal?: AbortSignal) => {
-    const body = await apiClient.get<unknown>(`${ADMIN}/agreement-requests/${requestId}`, { signal });
+  /** One promotion with every version, condition, tier and signature. */
+  get: async (id: string, signal?: AbortSignal) => {
+    const body = await apiClient.get<unknown>(`${PROMOTIONS}/${id}`, { signal });
 
-    return AgreementDetailSchema.parse(unwrapData(body));
+    return PromotionDetailSchema.parse(unwrapData(body));
+  },
+
+  create: async (input: CreatePromotionInput, signal?: AbortSignal) => {
+    const body = await apiClient.post<unknown>(PROMOTIONS, { body: input, signal });
+
+    return PromotionDetailSchema.parse(unwrapData(body));
   },
 
   /**
-   * Records one approver's decision.
+   * Moves a promotion along its lifecycle.
    *
-   * A comment is mandatory for `return` and `reject`. Returning reopens the request as a
-   * new revision and the next submission collects four fresh signatures.
+   * One function rather than seven, because the calls differ only in the segment and
+   * whether they carry a reason. `reject`, `deactivate` and `cancel` require one; the
+   * server refuses them without it, so the caller must supply it rather than sending an
+   * empty body and getting a 400 the user cannot act on.
    */
-  actOnStep: async (
-    requestId: string,
-    stepOrder: number,
-    outcome: AgreementOutcome,
-    comment: string | undefined,
+  transition: async (
+    id: string,
+    action: 'submit' | 'approve' | 'reject' | 'activate' | 'deactivate' | 'cancel',
+    payload?: { comment?: string; reason?: string },
     signal?: AbortSignal
   ) => {
-    const body = await apiClient.post<unknown>(
-      `${ADMIN}/agreement-requests/${requestId}/steps/${stepOrder}/${outcome}`,
-      { body: { comment }, signal }
-    );
-
-    return AgreementDetailSchema.parse(unwrapData(body));
-  },
-
-  /** The terms matrix: every approved rate and its state. */
-  listTerms: async (
-    query: { customerId?: string; categoryCode?: string; state?: string; page?: number; pageSize?: number } = {},
-    signal?: AbortSignal
-  ) => {
-    const body = await apiClient.get<unknown>(`${ADMIN}/agreement-terms`, {
-      query: query as ApiQuery,
+    const body = await apiClient.post<unknown>(`${PROMOTIONS}/${id}/${action}`, {
+      body: payload ?? {},
       signal,
     });
 
-    return TermPageSchema.parse(unwrapPage(body));
+    return PromotionDetailSchema.parse(unwrapData(body));
   },
 
-  /** Ends a term early. The reason is recorded against it. */
-  terminateTerm: async (termId: string, reason: string, signal?: AbortSignal) => {
-    const body = await apiClient.post<unknown>(`${ADMIN}/agreement-terms/${termId}/terminate`, {
-      body: { reason },
-      signal,
-    });
+  /** Queues the promotion's condition for the SAP SD team. */
+  syncToSap: async (id: string, signal?: AbortSignal) => {
+    const body = await apiClient.post<unknown>(`${PROMOTIONS}/${id}/sync-sap`, { signal });
 
-    return unwrapData(body);
+    return PromotionDetailSchema.parse(unwrapData(body));
   },
 
-  /** The SAP condition queue. Defaults server-side to outstanding work. */
-  listSapTasks: async (status?: string, signal?: AbortSignal) => {
-    const body = await apiClient.get<unknown>(`${ADMIN}/sap-tasks`, {
-      query: (status ? { status } : {}) as ApiQuery,
-      signal,
-    });
-
-    return z.array(SapTaskSchema).parse(unwrapList(body));
-  },
-
-  /**
-   * Records that SAP now holds the condition record — which is what makes a term
-   * chargeable. The record number is required, because it is the evidence.
-   */
-  completeSapTask: async (
-    taskId: string,
-    conditionRecord: string,
-    notes: string | undefined,
-    signal?: AbortSignal
-  ) => {
-    const body = await apiClient.post<unknown>(`${ADMIN}/sap-tasks/${taskId}/done`, {
-      body: { conditionRecord, notes },
-      signal,
-    });
-
-    return unwrapData(body);
-  },
-
-  /** Category-to-SAP price-group mappings. Ships empty; nothing works until filled. */
+  /** The category → SAP price group join every promotion is keyed on. */
   listCategoryMappings: async (signal?: AbortSignal) => {
-    const body = await apiClient.get<unknown>(`${ADMIN}/settings/category-mappings`, { signal });
+    const body = await apiClient.get<unknown>(`${API_V1}/settings/category-mappings`, { signal });
 
     return z.array(CategoryMappingSchema).parse(unwrapList(body));
-  },
-
-  /** The standing pickup rules. */
-  listPickupRules: async (signal?: AbortSignal) => {
-    const body = await apiClient.get<unknown>(`${ADMIN}/settings/pickup-rules`, { signal });
-
-    return z.array(PickupRuleSchema).parse(unwrapList(body));
-  },
-};
-
-// --- Raising a request -------------------------------------------------------
-
-/**
- * How a line's rate is expressed.
- *
- * `FlatPercent` is a single percentage. `Tiered` is a volume ladder and carries tiers
- * instead of a percent. `NoTarget` records an agreed arrangement with no rate attached.
- */
-export const ENTRY_MODES = ['FlatPercent', 'Tiered', 'NoTarget'] as const;
-export type EntryMode = (typeof ENTRY_MODES)[number];
-
-/** What the discount is, commercially. */
-export const NATURES = ['OnInvoice', 'VolumeRebate', 'ImmediatePayment'] as const;
-export type Nature = (typeof NATURES)[number];
-
-export interface AgreementTierInput {
-  tierOrder: number;
-  minAmount: number;
-  maxAmount?: number | null;
-  percent: number;
-}
-
-export interface AgreementLineInput {
-  categoryCode: string;
-  entryMode: EntryMode;
-  nature: Nature;
-  percent?: number | null;
-  currency?: string;
-  validFrom: string;
-  validTo?: string | null;
-  tiers?: AgreementTierInput[];
-}
-
-export interface CreateAgreementInput {
-  /**
-   * Makes creation idempotent — a retry returns the original request rather than
-   * raising a second. The form generates one per draft so a double submit, or a click
-   * on a flaky connection, cannot produce two proposals for the same depot.
-   */
-  clientRequestId?: string;
-  customerId: string;
-  scopeType?: string;
-  remarks?: string;
-  lines: AgreementLineInput[];
-}
-
-export const agreementWriteApi = {
-  /** Raises a request as a **draft**. It collects no signatures until submitted. */
-  create: async (input: CreateAgreementInput, signal?: AbortSignal) => {
-    const body = await apiClient.post<unknown>(`${ADMIN}/agreement-requests`, { body: input, signal });
-
-    return AgreementDetailSchema.parse(unwrapData(body));
-  },
-
-  /**
-   * Replaces a draft's content.
-   *
-   * Send every line the form shows — this replaces rather than merges, so an omitted
-   * category is deleted.
-   */
-  update: async (
-    requestId: string,
-    input: { remarks?: string; lines: AgreementLineInput[] },
-    signal?: AbortSignal
-  ) => {
-    const body = await apiClient.put<unknown>(`${ADMIN}/agreement-requests/${requestId}`, {
-      body: input,
-      signal,
-    });
-
-    return AgreementDetailSchema.parse(unwrapData(body));
-  },
-
-  /** Sends a draft to step 1 and opens all four signature slots. */
-  submit: async (requestId: string, signal?: AbortSignal) => {
-    const body = await apiClient.post<unknown>(`${ADMIN}/agreement-requests/${requestId}/submit`, { signal });
-
-    return AgreementDetailSchema.parse(unwrapData(body));
-  },
-
-  /** The author's own retraction. Terminal, and not the same as an approver's reject. */
-  withdraw: async (requestId: string, signal?: AbortSignal) => {
-    const body = await apiClient.post<unknown>(`${ADMIN}/agreement-requests/${requestId}/withdraw`, { signal });
-
-    return AgreementDetailSchema.parse(unwrapData(body));
   },
 };

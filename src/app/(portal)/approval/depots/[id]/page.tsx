@@ -26,10 +26,11 @@
  * a credit limit. When the backend carries a field, it can have a place on the page.
  */
 
-import { useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
 import { format } from 'date-fns';
+import { createPortal } from 'react-dom';
 import {
   AlertCircle,
   ArrowLeft,
@@ -40,11 +41,13 @@ import {
   CreditCard,
   ExternalLink,
   FileText,
+  ImageOff,
   Loader2,
   MapPin,
   Phone,
   ShieldCheck,
   Store,
+  X,
   XCircle,
 } from 'lucide-react';
 import { apiClient } from '@/infrastructure/api/client';
@@ -125,6 +128,179 @@ async function openDocument(url: string): Promise<void> {
   setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
 }
 
+/** True for a document the browser can render as a picture. */
+function isImage(contentType?: string | null): boolean {
+  return Boolean(contentType && contentType.startsWith('image/'));
+}
+
+/**
+ * Fetches each image document and hands back an object URL per document id.
+ *
+ * ## Why the pictures cannot simply be `src`
+ *
+ * The content route needs `customers.read` and a bearer token that lives in memory, so
+ * an `<img src={document.url}>` issues an unauthenticated GET and renders a broken
+ * image. Each one is therefore fetched through the API client and wrapped in an object
+ * URL, which `<img>` can load because the bytes are already local.
+ *
+ * ## Revocation
+ *
+ * Every URL created here pins its blob in memory until revoked, and a reviewer opening
+ * ten registrations would otherwise leave forty photographs behind. They are revoked
+ * when the effect tears down — on unmount, or when the document set changes.
+ *
+ * A ref mirrors the state so cleanup can revoke what was actually created: reading the
+ * state variable inside the cleanup closure would capture the value from the render the
+ * effect ran in, which is empty on the first pass and would leak every URL.
+ */
+function useDocumentImages(documents: DepotDetailDto['documents']): {
+  urls: Record<string, string>;
+  failed: Record<string, true>;
+  loading: boolean;
+} {
+  const [urls, setUrls] = useState<Record<string, string>>({});
+  const [failed, setFailed] = useState<Record<string, true>>({});
+  const [loading, setLoading] = useState(false);
+  const created = useRef<string[]>([]);
+
+  // The identity of the image set, not the array, so a re-render with an equal-but-new
+  // array does not re-download every photograph.
+  const key = documents
+    .filter((document) => isImage(document.contentType) && document.url)
+    .map((document) => document.id)
+    .join(',');
+
+  useEffect(() => {
+    const wanted = documents.filter((document) => isImage(document.contentType) && document.url);
+
+    if (wanted.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+
+    setLoading(true);
+
+    void (async () => {
+      for (const document of wanted) {
+        try {
+          const { blob } = await apiClient.downloadFile('GET', document.url!);
+
+          if (cancelled) {
+            return;
+          }
+
+          const objectUrl = URL.createObjectURL(blob);
+
+          created.current.push(objectUrl);
+          setUrls((previous) => ({ ...previous, [document.id]: objectUrl }));
+        } catch {
+          if (!cancelled) {
+            // A single unreadable document must not blank the others, so this is
+            // recorded per tile rather than raised.
+            setFailed((previous) => ({ ...previous, [document.id]: true }));
+          }
+        }
+      }
+
+      if (!cancelled) {
+        setLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+
+      for (const objectUrl of created.current) {
+        URL.revokeObjectURL(objectUrl);
+      }
+
+      created.current = [];
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+
+  return { urls, failed, loading };
+}
+
+/**
+ * The full-screen viewer.
+ *
+ * Rendered through a portal onto `document.body` so it escapes the page's grid and any
+ * stacking context the cards create — a fixed overlay inside a `sticky` column would be
+ * clipped by it. Closes on Escape, on the backdrop, and on the button; the image itself
+ * swallows the click so viewing it does not dismiss it.
+ */
+function Lightbox({
+  src,
+  title,
+  caption,
+  onClose,
+}: {
+  src: string;
+  title: string;
+  caption?: string | null;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        onClose();
+      }
+    };
+
+    window.addEventListener('keydown', onKey);
+
+    // The page behind must not scroll while the overlay is up.
+    const previousOverflow = document.body.style.overflow;
+
+    document.body.style.overflow = 'hidden';
+
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      onClick={onClose}
+      className="fixed inset-0 z-[100] bg-black/85 backdrop-blur-sm flex flex-col items-center justify-center p-4 sm:p-8"
+    >
+      <div className="w-full flex items-start justify-between gap-4 mb-3 max-w-6xl">
+        <div className="min-w-0">
+          <p className="text-[13px] font-semibold text-white truncate">{title}</p>
+          {caption && <p className="text-[11.5px] text-white/60 truncate">{caption}</p>}
+        </div>
+        <button
+          onClick={onClose}
+          aria-label="Close"
+          className="flex-shrink-0 inline-flex items-center justify-center w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 text-white transition-colors"
+        >
+          <X size={16} />
+        </button>
+      </div>
+
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={src}
+        alt={title}
+        onClick={(event) => event.stopPropagation()}
+        className="max-w-full max-h-[80vh] object-contain rounded-lg shadow-2xl"
+      />
+
+      <p className="text-[11px] text-white/50 mt-3">Click anywhere or press Esc to close</p>
+    </div>,
+    document.body
+  );
+}
+
+/** Stable identity, so the memos below do not recompute on every render while loading. */
+const EMPTY_DOCUMENTS: DepotDetailDto['documents'] = [];
+
 export default function DepotApprovalDetailPage() {
   const params = useParams();
   const router = useRouter();
@@ -138,6 +314,7 @@ export default function DepotApprovalDetailPage() {
   const [showReject, setShowReject] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
   const [openingDoc, setOpeningDoc] = useState<string | null>(null);
+  const [lightbox, setLightbox] = useState<string | null>(null);
   const [docError, setDocError] = useState<string | null>(null);
 
   const viewDocument = async (documentId: string, url: string) => {
@@ -152,6 +329,28 @@ export default function DepotApprovalDetailPage() {
       setOpeningDoc(null);
     }
   };
+
+  // Hooks before the early returns below, never after: React matches hooks by call
+  // order, so a `useDocumentImages` that runs only once the query resolves changes the
+  // count between the loading render and the loaded one and throws.
+  const documents = depot?.documents ?? EMPTY_DOCUMENTS;
+
+  const { urls: imageUrls, failed: imageFailed } = useDocumentImages(documents);
+
+  const images = useMemo(
+    () => documents.filter((document) => isImage(document.contentType) && document.url),
+    [documents]
+  );
+
+  const files = useMemo(
+    () => documents.filter((document) => !isImage(document.contentType) || !document.url),
+    [documents]
+  );
+
+  const openInLightbox = useCallback((documentId: string) => setLightbox(documentId), []);
+  const closeLightbox = useCallback(() => setLightbox(null), []);
+
+  const shown = lightbox ? documents.find((document) => document.id === lightbox) : null;
 
   const copy = (text: string, label: string) => {
     void navigator.clipboard.writeText(text);
@@ -315,33 +514,85 @@ export default function DepotApprovalDetailPage() {
             {record.documents.length === 0 ? (
               <p className="text-[12.5px] text-muted-foreground">Nothing uploaded.</p>
             ) : (
-              <ul className="space-y-1.5">
-                {record.documents.map((document) => (
-                  <li key={document.id} className="flex items-center gap-2.5 py-1.5">
-                    <FileText size={14} className="text-muted-foreground flex-shrink-0" />
-                    <span className="min-w-0 flex-1">
-                      <span className="block text-[12.5px] text-main truncate">
-                        {document.typeDisplay ?? document.type ?? 'Document'}
-                      </span>
-                      <span className="block text-[11px] text-muted-foreground truncate">{document.fileName}</span>
-                    </span>
-                    {document.url && (
-                      <button
-                        onClick={() => void viewDocument(document.id, document.url!)}
-                        disabled={openingDoc === document.id}
-                        className="text-[11.5px] text-primary inline-flex items-center gap-1 flex-shrink-0 disabled:opacity-50"
-                      >
-                        {openingDoc === document.id ? (
-                          <Loader2 size={10} className="animate-spin" />
-                        ) : (
-                          <ExternalLink size={10} />
+              <>
+                {/*
+                  Two columns, so the four documents a registration requires land as a
+                  2x2 block. A reviewer is comparing a shopfront against an identity card
+                  against a tax certificate, and doing that from filenames meant opening
+                  four tabs.
+                */}
+                {images.length > 0 && (
+                  <div className="grid grid-cols-2 gap-3">
+                    {images.map((document) => {
+                      const source = imageUrls[document.id];
+                      const broken = imageFailed[document.id];
+
+                      return (
+                        <button
+                          key={document.id}
+                          onClick={() => source && openInLightbox(document.id)}
+                          disabled={!source}
+                          className="group text-left rounded-xl border border-surface overflow-hidden bg-accent/20 hover:border-primary/40 transition-colors disabled:cursor-default"
+                        >
+                          <span className="block relative aspect-[4/3] bg-accent/40">
+                            {source ? (
+                              /* eslint-disable-next-line @next/next/no-img-element */
+                              <img
+                                src={source}
+                                alt={document.typeDisplay ?? 'Document'}
+                                className="absolute inset-0 w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-200"
+                              />
+                            ) : (
+                              <span className="absolute inset-0 flex items-center justify-center text-muted-foreground">
+                                {broken ? <ImageOff size={18} /> : <Loader2 size={16} className="animate-spin" />}
+                              </span>
+                            )}
+                          </span>
+                          <span className="block px-2.5 py-2">
+                            <span className="block text-[12px] font-medium text-main truncate">
+                              {document.typeDisplay ?? document.type ?? 'Document'}
+                            </span>
+                            <span className="block text-[10.5px] text-muted-foreground truncate">
+                              {broken ? 'Could not be loaded' : document.fileName}
+                            </span>
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Anything that is not a picture keeps the row-and-link treatment. */}
+                {files.length > 0 && (
+                  <ul className={`space-y-1.5 ${images.length > 0 ? 'mt-3 pt-3 border-t border-surface' : ''}`}>
+                    {files.map((document) => (
+                      <li key={document.id} className="flex items-center gap-2.5 py-1.5">
+                        <FileText size={14} className="text-muted-foreground flex-shrink-0" />
+                        <span className="min-w-0 flex-1">
+                          <span className="block text-[12.5px] text-main truncate">
+                            {document.typeDisplay ?? document.type ?? 'Document'}
+                          </span>
+                          <span className="block text-[11px] text-muted-foreground truncate">{document.fileName}</span>
+                        </span>
+                        {document.url && (
+                          <button
+                            onClick={() => void viewDocument(document.id, document.url!)}
+                            disabled={openingDoc === document.id}
+                            className="text-[11.5px] text-primary inline-flex items-center gap-1 flex-shrink-0 disabled:opacity-50"
+                          >
+                            {openingDoc === document.id ? (
+                              <Loader2 size={10} className="animate-spin" />
+                            ) : (
+                              <ExternalLink size={10} />
+                            )}
+                            View
+                          </button>
                         )}
-                        View
-                      </button>
-                    )}
-                  </li>
-                ))}
-              </ul>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </>
             )}
           </Card>
 
@@ -488,6 +739,15 @@ export default function DepotApprovalDetailPage() {
 
         </div>
       </div>
+
+      {shown && imageUrls[shown.id] && (
+        <Lightbox
+          src={imageUrls[shown.id]}
+          title={shown.typeDisplay ?? shown.type ?? 'Document'}
+          caption={shown.fileName}
+          onClose={closeLightbox}
+        />
+      )}
     </PageBody>
   );
 }

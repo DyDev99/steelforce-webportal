@@ -33,6 +33,7 @@ import {
   deviceMarkerKind,
   DEVICE_PIN_SIZE,
 } from '@/features/planning/lib/google-maps';
+import { hasCoordinates } from '@/features/planning/lib/geo';
 
 
 export default function SessionsAndDevicesPage() {
@@ -365,89 +366,118 @@ export default function SessionsAndDevicesPage() {
 
 function SessionsMap({ sessions }: { sessions: AdminSession[] }) {
   const mapRef = useRef<any>(null);
-  const markersRef = useRef<any[]>([]);
+  // Keyed by session id so a live position tick moves a pin instead of rebuilding
+  // every marker (which flickered and closed any open hover card).
+  const markersRef = useRef<Map<string, { marker: any; info: any }>>(new Map());
+  // The set of sessions the viewport was last fitted to. Live telemetry re-renders
+  // this component continuously; refitting on every tick yanked the map back while
+  // the user was panning or zooming.
+  const fittedKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     let active = true;
-    loadGoogleMaps().then((google) => {
-      if (!active) return;
-      const el = document.getElementById('sessions-map-container');
-      if (!el) return;
-      
-      if (!mapRef.current) {
-        mapRef.current = new google.maps.Map(el, {
-          center: { lat: 12.5657, lng: 104.9910 }, // Cambodia center
-          zoom: 7,
-          disableDefaultUI: true,
-          styles: LIGHT_MAP_STYLE,
-        });
-      }
-      
-      // Clear old markers
-      markersRef.current.forEach(m => m.setMap(null));
-      markersRef.current = [];
+    const markers = markersRef.current;
 
-      // Add new markers
-      sessions.filter(session => session.location).forEach(session => {
-        // Sustainable Green when the session is live, Slate when it is not.
-        const color = session.status === 'online' ? '#2C9942' : '#7D8BA0';
-        const kind = deviceMarkerKind(session.device.type, session.device.os);
+    loadGoogleMaps()
+      .then((google) => {
+        if (!active) return;
+        const el = document.getElementById('sessions-map-container');
+        if (!el) return;
 
-        // Standard Marker rather than AdvancedMarkerElement, which needs a Map ID.
-        const marker = new google.maps.Marker({
-          position: session.location,
-          map: mapRef.current,
-          icon: {
+        if (!mapRef.current) {
+          mapRef.current = new google.maps.Map(el, {
+            center: { lat: 12.5657, lng: 104.9910 }, // Cambodia center
+            zoom: 7,
+            disableDefaultUI: true,
+            styles: LIGHT_MAP_STYLE,
+          });
+        }
+
+        // Finite coordinates only: a NaN position blanks the whole map on fitBounds.
+        const located = sessions.filter((session) => hasCoordinates(session.location));
+        const seen = new Set<string>();
+
+        located.forEach((session) => {
+          const location = session.location!;
+          seen.add(session.id);
+          // Sustainable Green when the session is live, Slate when it is not.
+          const color = session.status === 'online' ? '#2C9942' : '#7D8BA0';
+          const kind = deviceMarkerKind(session.device.type, session.device.os);
+          const capturedAt = location.capturedAt
+            ? new Date(location.capturedAt).toLocaleString()
+            : null;
+          const content = `<div style="padding:4px 8px;font-family:sans-serif;">
+            <div style="font-weight:bold;font-size:12px;color:#12233D;">${session.repName}</div>
+            <div style="font-size:10px;color:#7D8BA0;margin-top:2px;">${session.device.model ?? 'Unknown device'} (${session.status})</div>
+            ${capturedAt ? `<div style="font-size:10px;color:#ADBACA;margin-top:2px;">Fix taken ${capturedAt}</div>` : ''}
+          </div>`;
+
+          let entry = markers.get(session.id);
+          if (!entry) {
+            // Standard Marker rather than AdvancedMarkerElement, which needs a Map ID.
+            const marker = new google.maps.Marker({ map: mapRef.current });
+            const info = new google.maps.InfoWindow({ disableAutoPan: true });
+            marker.addListener('mouseover', () => info.open(mapRef.current, marker));
+            marker.addListener('mouseout', () => info.close());
+            entry = { marker, info };
+            markers.set(session.id, entry);
+          }
+
+          entry.marker.setPosition({ lat: location.lat, lng: location.lng });
+          entry.marker.setIcon({
             url: devicePinIcon(kind, color),
             // The pin points at the coordinate from its tip, so the anchor is the
             // bottom centre. Anchoring at the centre would place every device half a
             // pin north of where it actually is.
             scaledSize: new google.maps.Size(DEVICE_PIN_SIZE.width, DEVICE_PIN_SIZE.height),
             anchor: new google.maps.Point(DEVICE_PIN_SIZE.width / 2, DEVICE_PIN_SIZE.height),
-          },
+          });
           // Live devices sit above dormant ones where pins overlap.
-          zIndex: session.status === 'online' ? 2 : 1,
-          title: `${session.repName} — ${session.device.model ?? 'Unknown device'}`,
+          entry.marker.setZIndex(session.status === 'online' ? 2 : 1);
+          entry.marker.setTitle(`${session.repName} — ${session.device.model ?? 'Unknown device'}`);
+          entry.info.setContent(content);
         });
 
-        const capturedAt = session.location?.capturedAt
-          ? new Date(session.location.capturedAt).toLocaleString()
-          : null;
-
-        const info = new google.maps.InfoWindow({
-          content: `<div style="padding:4px 8px;font-family:sans-serif;">
-            <div style="font-weight:bold;font-size:12px;color:#12233D;">${session.repName}</div>
-            <div style="font-size:10px;color:#7D8BA0;margin-top:2px;">${session.device.model ?? 'Unknown device'} (${session.status})</div>
-            ${capturedAt ? `<div style="font-size:10px;color:#ADBACA;margin-top:2px;">Fix taken ${capturedAt}</div>` : ''}
-          </div>`,
-          disableAutoPan: true
+        markers.forEach((entry, id) => {
+          if (!seen.has(id)) {
+            entry.info.close();
+            entry.marker.setMap(null);
+            markers.delete(id);
+          }
         });
 
-        marker.addListener('mouseover', () => info.open(mapRef.current, marker));
-        marker.addListener('mouseout', () => info.close());
+        // Refit only when the set of plotted sessions changes, not when they move.
+        const fitKey = located.map((s) => s.id).sort().join(',');
+        if (located.length === 0 || fitKey === fittedKeyRef.current) return;
+        fittedKeyRef.current = fitKey;
 
-        markersRef.current.push(marker);
-      });
-      
-      // Fit bounds if we have sessions
-      if (sessions.length > 0 && mapRef.current) {
         const bounds = new google.maps.LatLngBounds();
-        // Same filter as the markers: an unplotted session must not drag
-        // the viewport to the Gulf of Guinea.
-        const located = sessions.filter(s => s.location);
-        if (located.length === 0) return;
-        located.forEach(s => bounds.extend(s.location!));
+        located.forEach((s) => bounds.extend({ lat: s.location!.lat, lng: s.location!.lng }));
         mapRef.current.fitBounds(bounds);
         // Prevent zooming in too far on single points
         const listener = google.maps.event.addListener(mapRef.current, 'idle', () => {
           if (mapRef.current.getZoom() > 14) mapRef.current.setZoom(14);
           google.maps.event.removeListener(listener);
         });
-      }
-    });
-    
+      })
+      .catch(() => {
+        // No key, or the script was blocked. The session list below still shows
+        // every device and its coordinates, so the page stays usable without a map.
+      });
+
     return () => { active = false; };
   }, [sessions]);
-  
+
+  // Detach every pin when the map is hidden or the page unmounts.
+  useEffect(() => {
+    const markers = markersRef.current;
+    return () => {
+      markers.forEach((entry) => entry.marker.setMap(null));
+      markers.clear();
+      mapRef.current = null;
+      fittedKeyRef.current = null;
+    };
+  }, []);
+
   return null;
 }

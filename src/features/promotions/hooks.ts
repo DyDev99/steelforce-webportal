@@ -1,68 +1,54 @@
 /**
- * React Query bindings for the agreement pipeline.
+ * React Query bindings for promotions.
  *
- * Every mutation invalidates the whole `promotions` key. The four screens are one
- * pipeline: approving a request creates terms and queues SAP work, and closing a SAP
- * task flips a term to effective. Patching one list by hand would leave the other three
- * describing a state that no longer exists.
+ * Every mutation invalidates the list as well as the promotion it acted on: a transition
+ * changes the open version's status, which is what the catalogue and the approval queue
+ * are filtered by, so patching only the detail leaves both lists showing a decision that
+ * has already been taken.
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import {
-  agreementWriteApi,
-  promotionsApi,
-  type AgreementOutcome,
-  type AgreementLineInput,
-  type CreateAgreementInput,
-} from './api';
+import { promotionsApi, type CreatePromotionInput } from './api';
 
 export const promotionKeys = {
   all: ['promotions'] as const,
-  requests: (q: object) => [...promotionKeys.all, 'requests', q] as const,
-  request: (id: string) => [...promotionKeys.all, 'request', id] as const,
-  terms: (q: object) => [...promotionKeys.all, 'terms', q] as const,
-  sapTasks: (status?: string) => [...promotionKeys.all, 'sap-tasks', status ?? null] as const,
+  list: (query: Record<string, unknown>) => [...promotionKeys.all, 'list', query] as const,
+  detail: (id: string) => [...promotionKeys.all, 'detail', id] as const,
   categoryMappings: () => [...promotionKeys.all, 'category-mappings'] as const,
-  pickupRules: () => [...promotionKeys.all, 'pickup-rules'] as const,
 };
 
-export function useAgreementRequests(
-  query: { status?: string; step?: number; page?: number; pageSize?: number } = {},
-  enabled = true
+/** The catalogue. */
+export function usePromotions(
+  query: {
+    status?: string;
+    businessType?: string;
+    sapStatus?: string;
+    search?: string;
+    pageSize?: number;
+  } = {}
 ) {
   return useQuery({
-    queryKey: promotionKeys.requests(query),
-    queryFn: ({ signal }) => promotionsApi.listRequests(query, signal),
-    enabled,
+    queryKey: promotionKeys.list(query),
+    queryFn: ({ signal }) => promotionsApi.list(query, signal),
     staleTime: 30_000,
   });
 }
 
-/** Disabled until a row is opened — the detail carries lines and the full timeline. */
-export function useAgreementRequest(requestId: string | null) {
+/**
+ * One promotion, with its versions.
+ *
+ * `staleTime: 0` — this is what somebody reads before signing, and a stale copy could
+ * show a version another approver has already decided.
+ */
+export function usePromotion(id: string | undefined) {
   return useQuery({
-    queryKey: promotionKeys.request(requestId ?? ''),
-    queryFn: ({ signal }) => promotionsApi.getRequest(requestId!, signal),
-    enabled: Boolean(requestId),
-    staleTime: 15_000,
+    queryKey: promotionKeys.detail(id ?? ''),
+    queryFn: ({ signal }) => promotionsApi.get(id!, signal),
+    enabled: Boolean(id),
+    staleTime: 0,
   });
 }
 
-export function useAgreementTerms(query: { state?: string; categoryCode?: string; page?: number; pageSize?: number } = {}) {
-  return useQuery({
-    queryKey: promotionKeys.terms(query),
-    queryFn: ({ signal }) => promotionsApi.listTerms(query, signal),
-    staleTime: 30_000,
-  });
-}
-
-export function useSapTasks(status?: string) {
-  return useQuery({
-    queryKey: promotionKeys.sapTasks(status),
-    queryFn: ({ signal }) => promotionsApi.listSapTasks(status, signal),
-    staleTime: 30_000,
-  });
-}
-
+/** The category → SAP price group join. Changes rarely. */
 export function useCategoryMappings() {
   return useQuery({
     queryKey: promotionKeys.categoryMappings(),
@@ -71,89 +57,35 @@ export function useCategoryMappings() {
   });
 }
 
-export function usePickupRules() {
-  return useQuery({
-    queryKey: promotionKeys.pickupRules(),
-    queryFn: ({ signal }) => promotionsApi.listPickupRules(signal),
-    staleTime: 5 * 60_000,
+export function useCreatePromotion() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (input: CreatePromotionInput) => promotionsApi.create(input),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: promotionKeys.all }),
   });
 }
 
-/** Records an approver's decision on one step. */
-export function useActOnStep() {
-  const client = useQueryClient();
+/** Submit, approve, reject, activate, deactivate or cancel. */
+export function usePromotionTransition(id: string) {
+  const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({
-      requestId,
-      stepOrder,
-      outcome,
-      comment,
-    }: {
-      requestId: string;
-      stepOrder: number;
-      outcome: AgreementOutcome;
+    mutationFn: (input: {
+      action: 'submit' | 'approve' | 'reject' | 'activate' | 'deactivate' | 'cancel';
       comment?: string;
-    }) => promotionsApi.actOnStep(requestId, stepOrder, outcome, comment),
-    onSettled: () => client.invalidateQueries({ queryKey: promotionKeys.all }),
+      reason?: string;
+    }) => promotionsApi.transition(id, input.action, { comment: input.comment, reason: input.reason }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: promotionKeys.all }),
   });
 }
 
-/** Closes a SAP condition task, which is what makes the term chargeable. */
-export function useCompleteSapTask() {
-  const client = useQueryClient();
+/** Queues the SAP condition. */
+export function useSyncPromotionToSap(id: string) {
+  const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ taskId, conditionRecord, notes }: { taskId: string; conditionRecord: string; notes?: string }) =>
-      promotionsApi.completeSapTask(taskId, conditionRecord, notes),
-    onSettled: () => client.invalidateQueries({ queryKey: promotionKeys.all }),
-  });
-}
-
-/** Raises a new draft request. */
-export function useCreateAgreement() {
-  const client = useQueryClient();
-
-  return useMutation({
-    mutationFn: (input: CreateAgreementInput) => agreementWriteApi.create(input),
-    onSettled: () => client.invalidateQueries({ queryKey: promotionKeys.all }),
-  });
-}
-
-/** Replaces a draft's lines and remarks. */
-export function useUpdateAgreement() {
-  const client = useQueryClient();
-
-  return useMutation({
-    mutationFn: ({
-      requestId,
-      remarks,
-      lines,
-    }: {
-      requestId: string;
-      remarks?: string;
-      lines: AgreementLineInput[];
-    }) => agreementWriteApi.update(requestId, { remarks, lines }),
-    onSettled: () => client.invalidateQueries({ queryKey: promotionKeys.all }),
-  });
-}
-
-/** Sends a draft onto the approval chain. */
-export function useSubmitAgreement() {
-  const client = useQueryClient();
-
-  return useMutation({
-    mutationFn: (requestId: string) => agreementWriteApi.submit(requestId),
-    onSettled: () => client.invalidateQueries({ queryKey: promotionKeys.all }),
-  });
-}
-
-/** Retracts a request the author no longer wants signed. */
-export function useWithdrawAgreement() {
-  const client = useQueryClient();
-
-  return useMutation({
-    mutationFn: (requestId: string) => agreementWriteApi.withdraw(requestId),
-    onSettled: () => client.invalidateQueries({ queryKey: promotionKeys.all }),
+    mutationFn: () => promotionsApi.syncToSap(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: promotionKeys.all }),
   });
 }
