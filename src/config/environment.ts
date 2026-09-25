@@ -30,9 +30,15 @@ export const environment = {
   apiBaseUrl: trimTrailingSlash(process.env.NEXT_PUBLIC_API_BASE_URL ?? ''),
   apiTimeoutMs: configuredTimeout(process.env.NEXT_PUBLIC_API_TIMEOUT),
 
-  /** Identity may live at a different host than the feature API. */
-  authApiUrl: trimTrailingSlash(process.env.NEXT_PUBLIC_AUTH_API_URL ?? '/api/v1/auth'),
-  authMode: (process.env.NEXT_PUBLIC_AUTH_MODE ??
+  /**
+   * Identity may live at a different host than the feature API.
+   *
+   * `||` rather than `??` for these two: CI passes unset Docker build args
+   * through as empty strings, and an empty auth URL or mode must fall back to
+   * the default instead of being taken literally.
+   */
+  authApiUrl: trimTrailingSlash(process.env.NEXT_PUBLIC_AUTH_API_URL || '/api/v1/auth'),
+  authMode: (process.env.NEXT_PUBLIC_AUTH_MODE ||
     (process.env.NODE_ENV === 'production' ? 'api' : 'static')) as AuthMode,
 
   /** Optional. Planning falls back to the built-in demo map when unset. */

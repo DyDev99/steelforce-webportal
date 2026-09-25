@@ -9,7 +9,8 @@
 # If a `dev` stage is ever added here, it must go ABOVE runner or Compose will
 # silently start shipping the development image.
 #
-# Build context is ./admin-web-portal (see docker-compose.yml).
+# Build context is the repository root (see compose.yaml and
+# .github/workflows/ci-cd.yml).
 #
 # No `# syntax=` directive on purpose: pinning an external Dockerfile frontend
 # makes every build fetch it from Docker Hub first. Nothing here needs a newer
@@ -45,19 +46,28 @@ FROM base AS builder
 WORKDIR /app
 
 # Next compiles rewrites into the build output, so the proxy target has to be
-# known here rather than at run time. Compose passes the service DNS name.
+# known here rather than at run time. Unset, next.config.js falls back to the
+# staging API.
 ARG BACKEND_INTERNAL_URL
 
 # NEXT_PUBLIC_* is inlined into the browser bundle at build time. Keep this a
 # relative path so one image stays promotable across environments and the
 # browser never learns an internal hostname.
-#
-# The app reads further NEXT_PUBLIC_* values (AUTH_API_URL, API_TIMEOUT,
-# GOOGLE_MAPS_API_KEY) that are intentionally NOT declared here:
-# src/config/environment.ts falls back with `??`, which treats an empty string
-# as a real value - an empty ENV would defeat the fallback rather than trigger
-# it. Add an ARG/ENV pair only alongside a genuine value.
 ARG NEXT_PUBLIC_API_BASE_URL
+
+# The remaining NEXT_PUBLIC_* values the app reads. Every one of them is safe
+# to pass as an empty string: src/config/environment.ts falls back with `||`
+# for the URL and mode, validates the timeout, and compares the two feature
+# flags against the literal 'true'.
+#
+# The Maps key ships to the browser by design (it is restricted by HTTP
+# referrer in Google Cloud, not by secrecy). These ARGs exist only in this
+# stage, so none of them appears in the runner image's history.
+ARG NEXT_PUBLIC_AUTH_API_URL
+ARG NEXT_PUBLIC_API_TIMEOUT
+ARG NEXT_PUBLIC_GOOGLE_MAPS_API_KEY
+ARG NEXT_PUBLIC_USER_MANAGEMENT_API=false
+ARG NEXT_PUBLIC_DEPOTS_API=false
 
 # Which auth repository the app binds at build time.
 #
@@ -69,13 +79,17 @@ ARG NEXT_PUBLIC_API_BASE_URL
 # when NODE_ENV is not production, and this image always sets NODE_ENV=production
 # - so without this the container would silently demand a live API.
 #
-# The `:-static` on the ENV line is not redundant: an ARG passed through as an
-# empty string would otherwise survive the `??` in environment.ts and resolve to
-# neither 'api' nor 'static', quietly selecting the API repository.
+# The `:-static` on the ENV line keeps that default when the ARG is passed
+# through as an empty string (environment.ts would otherwise pick 'api').
 ARG NEXT_PUBLIC_AUTH_MODE=static
 
 ENV BACKEND_INTERNAL_URL=${BACKEND_INTERNAL_URL} \
     NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL} \
+    NEXT_PUBLIC_AUTH_API_URL=${NEXT_PUBLIC_AUTH_API_URL} \
+    NEXT_PUBLIC_API_TIMEOUT=${NEXT_PUBLIC_API_TIMEOUT} \
+    NEXT_PUBLIC_GOOGLE_MAPS_API_KEY=${NEXT_PUBLIC_GOOGLE_MAPS_API_KEY} \
+    NEXT_PUBLIC_USER_MANAGEMENT_API=${NEXT_PUBLIC_USER_MANAGEMENT_API} \
+    NEXT_PUBLIC_DEPOTS_API=${NEXT_PUBLIC_DEPOTS_API} \
     NEXT_PUBLIC_AUTH_MODE=${NEXT_PUBLIC_AUTH_MODE:-static} \
     NODE_ENV=production
 
@@ -107,11 +121,11 @@ USER node
 
 EXPOSE 3000
 
-# Node 18+ has a global fetch, so this needs no extra package. Any response
-# below 500 counts as healthy: `/` renders a client-side redirect to /login,
-# so a 3xx or 4xx still proves the server is serving.
+# Node 18+ has a global fetch, so this needs no extra package. /healthz is a
+# route handler that answers 200 without touching the backend
+# (src/app/healthz/route.ts), so a backend outage never restarts the portal.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
-    CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
+    CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 # The standalone build emits its own minimal server; `next start` is not used.
 CMD ["node", "server.js"]

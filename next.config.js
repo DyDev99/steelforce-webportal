@@ -4,6 +4,7 @@
  */
 const backendTargetUrl =
   process.env.BACKEND_INTERNAL_URL ||
+  process.env.API_BASE_URL ||
   process.env.API_PROXY_URL ||
   'https://www.pnc-spts-stg-api.me';
 
