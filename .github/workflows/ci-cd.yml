@@ -1,0 +1,240 @@
+# =============================================================================
+# SteelForce Admin Web Portal - CI/CD.
+#
+#   pull_request     verify -> image (build + smoke test, NOT pushed)
+#   push to main     verify -> image (build + smoke test + push) -> deploy
+#   manual dispatch  same as push to main, for re-running a deploy
+#
+# Deploy runs only when the repository Variable DEPLOY_ENABLED is 'true', so
+# this workflow is safe to merge before the server exists. Configuration and
+# secrets are documented in docs/deployment.md.
+# =============================================================================
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# One pipeline per ref. Never cancel a run that may be mid-deploy on main.
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  NODE_VERSION: '20'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # No test suite exists yet; this starts running the moment a `test`
+      # script is added to package.json.
+      - name: Test
+        run: npm test --if-present
+
+      - name: Build
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+
+  # ---------------------------------------------------------------------------
+  image:
+    name: Docker image
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # GHCR image names must be lowercase; the repository owner is not.
+      - name: Resolve image name
+        id: ref
+        run: |
+          name="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "image=${name}:sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ steps.ref.outputs.name }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=pr
+
+      # Everything below is build-time configuration (see Dockerfile). The
+      # values are public in the browser bundle anyway; the Maps key is kept
+      # in Secrets only so it is masked in logs.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: steelforce-portal:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BACKEND_INTERNAL_URL=${{ vars.BACKEND_INTERNAL_URL }}
+            NEXT_PUBLIC_API_BASE_URL=${{ vars.NEXT_PUBLIC_API_BASE_URL }}
+            NEXT_PUBLIC_API_TIMEOUT=${{ vars.NEXT_PUBLIC_API_TIMEOUT }}
+            NEXT_PUBLIC_AUTH_API_URL=${{ vars.NEXT_PUBLIC_AUTH_API_URL }}
+            NEXT_PUBLIC_AUTH_MODE=${{ vars.NEXT_PUBLIC_AUTH_MODE || 'api' }}
+            NEXT_PUBLIC_USER_MANAGEMENT_API=${{ vars.NEXT_PUBLIC_USER_MANAGEMENT_API || 'false' }}
+            NEXT_PUBLIC_DEPOTS_API=${{ vars.NEXT_PUBLIC_DEPOTS_API || 'false' }}
+            NEXT_PUBLIC_GOOGLE_MAPS_API_KEY=${{ secrets.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY }}
+
+      - name: Smoke test container
+        run: |
+          docker run -d --name portal-smoke -p 127.0.0.1:3000:3000 steelforce-portal:ci
+          for _ in $(seq 1 30); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' portal-smoke)"
+            [ "$status" = healthy ] && break
+            sleep 2
+          done
+          docker ps --filter name=portal-smoke
+          curl -fsS http://127.0.0.1:3000/healthz
+          curl -fsS -o /dev/null -w 'login page: HTTP %{http_code}\n' http://127.0.0.1:3000/login
+          [ "$status" = healthy ] || { docker logs portal-smoke; exit 1; }
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs portal-smoke || true
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same inputs as the build above, so every layer is a cache hit.
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          build-args: |
+            BACKEND_INTERNAL_URL=${{ vars.BACKEND_INTERNAL_URL }}
+            NEXT_PUBLIC_API_BASE_URL=${{ vars.NEXT_PUBLIC_API_BASE_URL }}
+            NEXT_PUBLIC_API_TIMEOUT=${{ vars.NEXT_PUBLIC_API_TIMEOUT }}
+            NEXT_PUBLIC_AUTH_API_URL=${{ vars.NEXT_PUBLIC_AUTH_API_URL }}
+            NEXT_PUBLIC_AUTH_MODE=${{ vars.NEXT_PUBLIC_AUTH_MODE || 'api' }}
+            NEXT_PUBLIC_USER_MANAGEMENT_API=${{ vars.NEXT_PUBLIC_USER_MANAGEMENT_API || 'false' }}
+            NEXT_PUBLIC_DEPOTS_API=${{ vars.NEXT_PUBLIC_DEPOTS_API || 'false' }}
+            NEXT_PUBLIC_GOOGLE_MAPS_API_KEY=${{ secrets.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY }}
+
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to server
+    needs: image
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Scopes the deploy secrets and lets you require a manual approval
+    # (Settings -> Environments -> production -> Required reviewers).
+    environment:
+      name: production
+      url: ${{ vars.PUBLIC_URL }}
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE: ${{ needs.image.outputs.image }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/steelforce-portal' }}
+      SSH_TARGET: ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}
+      SSH_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: deploy
+
+      # The key is written with umask 077 and never echoed. known_hosts is
+      # pinned from a secret instead of trusting whatever host answers.
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          ( umask 077; printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key )
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host deploy-target
+            HostName ${SSH_TARGET#*@}
+            User ${SSH_TARGET%@*}
+            Port ${SSH_PORT}
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          EOF
+
+      - name: Upload deploy files
+        run: |
+          ssh deploy-target "mkdir -p '$DEPLOY_PATH'"
+          scp deploy/compose.yaml deploy/deploy.sh "deploy-target:$DEPLOY_PATH/"
+          ssh deploy-target "chmod +x '$DEPLOY_PATH/deploy.sh'"
+
+      # The registry token travels over stdin, so it never appears in the
+      # remote process list or in these logs. It is job-scoped and expires
+      # when this job ends; the server logs out again either way.
+      - name: Deploy
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" | ssh deploy-target \
+            "docker login '$REGISTRY' -u '${{ github.actor }}' --password-stdin >/dev/null"
+          status=0
+          ssh deploy-target "'$DEPLOY_PATH/deploy.sh' deploy '$IMAGE'" || status=$?
+          ssh deploy-target "docker logout '$REGISTRY' >/dev/null" || true
+          exit "$status"
+
+      - name: Verify public URL
+        if: vars.PUBLIC_URL != ''
+        run: |
+          for _ in $(seq 1 10); do
+            curl -fsS --max-time 10 "${{ vars.PUBLIC_URL }}/healthz" && exit 0
+            sleep 3
+          done
+          echo "::error::${{ vars.PUBLIC_URL }}/healthz did not answer"; exit 1
+
+      - name: Clean up SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

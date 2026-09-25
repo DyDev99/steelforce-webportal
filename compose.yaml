@@ -1,0 +1,39 @@
+# =============================================================================
+# SteelForce Admin Web Portal - local Docker build and run.
+#
+#   docker compose up --build        build the production image and run it
+#   docker compose down              stop and remove the container
+#
+# This builds from source. Servers never do: they run the prebuilt registry
+# image through deploy/compose.yaml (see docs/deployment.md).
+#
+# Build args are interpolated from your shell and from a `.env` file next to
+# this one, if present. The file itself never enters the image - .dockerignore
+# excludes it - only the values listed below do, and only at build time.
+# =============================================================================
+
+name: steelforce-portal
+
+services:
+  portal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BACKEND_INTERNAL_URL: ${BACKEND_INTERNAL_URL:-${API_BASE_URL:-${API_PROXY_URL:-}}}
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-}
+        NEXT_PUBLIC_API_TIMEOUT: ${NEXT_PUBLIC_API_TIMEOUT:-}
+        NEXT_PUBLIC_AUTH_API_URL: ${NEXT_PUBLIC_AUTH_API_URL:-}
+        NEXT_PUBLIC_AUTH_MODE: ${NEXT_PUBLIC_AUTH_MODE:-static}
+        NEXT_PUBLIC_GOOGLE_MAPS_API_KEY: ${NEXT_PUBLIC_GOOGLE_MAPS_API_KEY:-}
+        NEXT_PUBLIC_USER_MANAGEMENT_API: ${NEXT_PUBLIC_USER_MANAGEMENT_API:-false}
+        NEXT_PUBLIC_DEPOTS_API: ${NEXT_PUBLIC_DEPOTS_API:-false}
+    image: steelforce-portal:local
+    restart: unless-stopped
+    ports:
+      # Loopback only, matching the production layout.
+      - "127.0.0.1:${PORTAL_PORT:-3000}:3000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

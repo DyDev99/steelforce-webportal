@@ -1,0 +1,54 @@
+# =============================================================================
+# SteelForce Admin Web Portal - production runtime on a Docker host.
+#
+# Copied to the server by .github/workflows/ci-cd.yml together with deploy.sh.
+# It never builds: it runs a prebuilt image from the registry, whose reference
+# deploy.sh supplies as PORTAL_IMAGE. Run it through deploy.sh rather than
+# `docker compose` directly, so the current/previous image bookkeeping that
+# rollback depends on stays correct.
+#
+# The portal is stateless - no volumes, no database. Recreating the container
+# loses nothing, and nothing here touches the backend's stack or its data.
+# =============================================================================
+
+name: steelforce-portal
+
+services:
+  portal:
+    image: ${PORTAL_IMAGE:?PORTAL_IMAGE must be set - run this through deploy.sh}
+    # Brings the container back after a crash and after a host reboot, but not
+    # after an operator's deliberate `docker compose stop`.
+    restart: unless-stopped
+    # Build-time configuration is already inside the image (see Dockerfile).
+    # Only runtime settings belong here.
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+    ports:
+      # Bound to the loopback interface. TLS terminates at the reverse proxy
+      # (nginx/Caddy/Traefik) in front of this host, which forwards to
+      # 127.0.0.1:${PORTAL_PORT}. Same layout as the backend's compose.prod.yaml.
+      - "127.0.0.1:${PORTAL_PORT:-3000}:3000"
+    # The image's HEALTHCHECK probes /healthz; `docker compose up --wait` in
+    # deploy.sh blocks on it before a deploy counts as successful.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      # Non-root node process on an unprivileged port: it needs no capabilities.
+      - ALL
+    read_only: true
+    tmpfs:
+      # Next writes its fetch/ISR cache under .next/cache; everything else in
+      # the image is read-only at run time.
+      - /app/.next/cache:uid=1000,gid=1000
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

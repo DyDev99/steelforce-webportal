@@ -1,0 +1,493 @@
+'use client';
+
+/**
+ * Depot registration — the approval decision page.
+ *
+ * ## What changed and why
+ *
+ * This page used to read `getDepotApprovalDetail(id)`, a synchronous lookup against a
+ * hardcoded fixture, defaulting to `'REQ-D-8821'`. Real depots are keyed by GUID and were
+ * never in that table, so every genuine registration fell through to a fabricated record:
+ * an approver looking at `BP-202609-00004` was shown somebody else's numbers. The approve
+ * and reject buttons were a `setTimeout` over local state, so a decision taken here
+ * reached nothing.
+ *
+ * Both now go to the server. Approving a depot **pushes it to SAP and adopts the customer
+ * number SAP returns as the depot's code**, so the decision is consequential and the
+ * record must be re-read afterwards rather than patched locally.
+ *
+ * ## Only what the backend actually holds
+ *
+ * The fixture carried `industry`, `segment`, `tier`, `creditScore`, `creditRiskRating`,
+ * projected revenue, operating hours, `yearEstablished`, `legalName`, `registrationNo`
+ * and more. **None of those exist anywhere in the platform.** They are not rendered as
+ * blanks here, they are gone: a section of em-dashes invites somebody to treat the next
+ * plausible-looking number as real, and this is the screen where the business commits to
+ * a credit limit. When the backend carries a field, it can have a place on the page.
+ */
+
+import { useState } from 'react';
+import Link from 'next/link';
+import { useParams, useRouter } from 'next/navigation';
+import { format } from 'date-fns';
+import {
+  AlertCircle,
+  ArrowLeft,
+  Building2,
+  Check,
+  CheckCircle2,
+  Copy,
+  CreditCard,
+  ExternalLink,
+  FileText,
+  Loader2,
+  MapPin,
+  Phone,
+  ShieldCheck,
+  Store,
+  XCircle,
+} from 'lucide-react';
+import { apiClient } from '@/infrastructure/api/client';
+import { Card } from '@/components/ui/card';
+import { PageBody } from '@/components/layout/page-layout';
+import { SectionHeader } from '@/components/layout/section-header';
+import {
+  useApproveDepot,
+  useDepotApproval,
+  useRejectDepot,
+  type DepotDetailDto,
+} from '@/features/approvals';
+
+/** Renders a value, or a muted dash when the record genuinely has none. */
+function Field({ label, value }: { label: string; value?: string | number | null }) {
+  const empty = value === null || value === undefined || value === '';
+
+  return (
+    <div className="min-w-0">
+      <dt className="text-[10.5px] uppercase tracking-wide text-muted-foreground mb-0.5">{label}</dt>
+      <dd className={`text-[13px] break-words ${empty ? 'text-muted-foreground' : 'text-main font-medium'}`}>
+        {empty ? '—' : value}
+      </dd>
+    </div>
+  );
+}
+
+const STATUS_TONE: Record<string, string> = {
+  PendingApproval: 'bg-amber-50 text-amber-700 border-amber-200',
+  Active: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  Rejected: 'bg-rose-50 text-rose-700 border-rose-200',
+  Draft: 'bg-slate-50 text-slate-600 border-slate-200',
+};
+
+function StatusChip({ status }: { status: string }) {
+  return (
+    <span
+      className={`inline-flex items-center px-2 py-0.5 rounded-full border text-[11px] font-medium ${
+        STATUS_TONE[status] ?? 'bg-slate-50 text-slate-600 border-slate-200'
+      }`}
+    >
+      {status}
+    </span>
+  );
+}
+
+/** A date the server sent, or a dash. Never today's date as a stand-in. */
+function when(value?: string | null): string | null {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = new Date(value);
+
+  return Number.isNaN(parsed.getTime()) ? null : format(parsed, 'd MMM yyyy, HH:mm');
+}
+
+/**
+ * Opens a document in a new tab.
+ *
+ * ## Why this is not an anchor
+ *
+ * The content route requires `customers.read` and a bearer token. A plain
+ * `<a target="_blank">` sends neither — the browser opens a bare GET with no
+ * Authorization header — so every "View" answered 401. The token lives in memory in the
+ * API client, not in a cookie, so there is nothing for the new tab to inherit.
+ *
+ * So the bytes are fetched with the token, wrapped in an object URL and handed to the
+ * tab. The URL is revoked on a delay rather than immediately: revoking in the same tick
+ * cancels the load in some browsers, and the tab has to have read it first.
+ */
+async function openDocument(url: string): Promise<void> {
+  const { blob } = await apiClient.downloadFile('GET', url);
+  const objectUrl = URL.createObjectURL(blob);
+
+  window.open(objectUrl, '_blank', 'noopener,noreferrer');
+
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+}
+
+export default function DepotApprovalDetailPage() {
+  const params = useParams();
+  const router = useRouter();
+  const id = (params.id as string) ?? '';
+
+  const { data: depot, isLoading, isError, error } = useDepotApproval(id);
+  const approve = useApproveDepot(id);
+  const reject = useRejectDepot(id);
+
+  const [rejectReason, setRejectReason] = useState('');
+  const [showReject, setShowReject] = useState(false);
+  const [copied, setCopied] = useState<string | null>(null);
+  const [openingDoc, setOpeningDoc] = useState<string | null>(null);
+  const [docError, setDocError] = useState<string | null>(null);
+
+  const viewDocument = async (documentId: string, url: string) => {
+    setOpeningDoc(documentId);
+    setDocError(null);
+
+    try {
+      await openDocument(url);
+    } catch (cause) {
+      setDocError(cause instanceof Error ? cause.message : 'The document could not be opened.');
+    } finally {
+      setOpeningDoc(null);
+    }
+  };
+
+  const copy = (text: string, label: string) => {
+    void navigator.clipboard.writeText(text);
+    setCopied(label);
+    setTimeout(() => setCopied(null), 2000);
+  };
+
+  if (isLoading) {
+    return (
+      <PageBody>
+        <div className="flex items-center gap-2 text-muted-foreground text-[13px] py-16 justify-center">
+          <Loader2 size={15} className="animate-spin" /> Loading registration…
+        </div>
+      </PageBody>
+    );
+  }
+
+  if (isError || !depot) {
+    return (
+      <PageBody>
+        <Card className="p-6 rounded-card border-surface card-shadow">
+          <div className="flex items-start gap-3">
+            <AlertCircle size={18} className="text-rose-600 mt-0.5 flex-shrink-0" />
+            <div className="min-w-0">
+              <p className="text-[13px] font-semibold text-main">This registration could not be loaded.</p>
+              <p className="text-[12px] text-muted-foreground mt-1 break-words">
+                {error instanceof Error ? error.message : 'The depot may have been removed, or you may not have access to it.'}
+              </p>
+              <Link href="/approval/depots" className="inline-flex items-center gap-1 text-[12px] text-primary mt-3">
+                <ArrowLeft size={12} /> Back to the queue
+              </Link>
+            </div>
+          </div>
+        </Card>
+      </PageBody>
+    );
+  }
+
+  const record: DepotDetailDto = depot;
+  const decided = record.status !== 'PendingApproval';
+  const busy = approve.isPending || reject.isPending;
+  const sapNumber = record.sap?.sapCustomerId ?? null;
+
+  const onApprove = () => {
+    approve.mutate(undefined, { onSuccess: () => router.refresh() });
+  };
+
+  const onReject = () => {
+    if (rejectReason.trim().length < 3) {
+      return;
+    }
+
+    reject.mutate(rejectReason.trim(), {
+      onSuccess: () => {
+        setShowReject(false);
+        setRejectReason('');
+      },
+    });
+  };
+
+  return (
+    <PageBody>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3 min-w-0">
+          <Link
+            href="/approval/depots"
+            className="inline-flex items-center gap-1 text-[12px] text-muted-foreground hover:text-main transition-colors"
+          >
+            <ArrowLeft size={13} /> Queue
+          </Link>
+          <div className="min-w-0">
+            <h1 className="text-[17px] font-semibold text-main truncate">{record.name}</h1>
+            <button
+              onClick={() => copy(record.code, 'code')}
+              className="inline-flex items-center gap-1 text-[12px] text-muted-foreground hover:text-main"
+            >
+              {record.code}
+              {copied === 'code' ? <Check size={11} /> : <Copy size={11} />}
+            </button>
+          </div>
+        </div>
+        <StatusChip status={record.status} />
+      </div>
+
+      {/* The outcome of the last decision, when there was one. */}
+      {record.sapRegistration?.lastError && (
+        <Card className="p-4 rounded-card border-rose-200 bg-rose-50/60">
+          <div className="flex items-start gap-2.5">
+            <AlertCircle size={15} className="text-rose-600 mt-0.5 flex-shrink-0" />
+            <div className="min-w-0">
+              <p className="text-[12.5px] font-semibold text-rose-900">SAP refused the last attempt</p>
+              <p className="text-[12px] text-rose-800 mt-0.5 break-words">{record.sapRegistration.lastError}</p>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+        <div className="xl:col-span-2 space-y-4">
+          <Card className="p-5 rounded-card border-surface card-shadow">
+            <SectionHeader title="Registration" icon={Store} />
+            <dl className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+              <Field label="Code" value={record.code} />
+              <Field label="Previous code" value={record.previousCode} />
+              <Field label="Type" value={record.type} />
+              <Field label="Phone" value={record.phone} />
+              <Field label="Email" value={record.email} />
+              <Field label="Contact person" value={record.contactPerson} />
+              <Field label="Telegram" value={record.telegramUsername} />
+              <Field label="Registered" value={when(record.createdAt)} />
+              <Field label="Approved" value={when(record.approvedAt)} />
+            </dl>
+            {record.description && (
+              <p className="text-[12.5px] text-muted-foreground mt-4 pt-4 border-t border-surface">{record.description}</p>
+            )}
+          </Card>
+
+          <Card className="p-5 rounded-card border-surface card-shadow">
+            <SectionHeader title="Address" icon={MapPin} />
+            <dl className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+              <Field label="House no." value={record.address?.houseNo} />
+              <Field label="Street" value={record.address?.line1} />
+              <Field label="Line 2" value={record.address?.line2} />
+              <Field label="District" value={record.address?.district} />
+              <Field label="City" value={record.address?.city} />
+              <Field label="Province" value={record.address?.province} />
+              <Field label="Postal code" value={record.address?.postalCode} />
+              <Field label="Region" value={record.address?.region} />
+              <Field label="Country" value={record.address?.country} />
+            </dl>
+            {record.address?.latitude != null && record.address?.longitude != null && (
+              <a
+                href={`https://www.google.com/maps?q=${record.address.latitude},${record.address.longitude}`}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 text-[12px] text-primary mt-4"
+              >
+                <MapPin size={12} /> {record.address.latitude}, {record.address.longitude}
+                <ExternalLink size={11} />
+              </a>
+            )}
+          </Card>
+
+          <Card className="p-5 rounded-card border-surface card-shadow">
+            <SectionHeader
+              title="Documents"
+              icon={FileText}
+              count={record.documents.length}
+              subtitle={record.documentsComplete ? 'Complete' : 'Required documents are missing'}
+            />
+            {record.missingRequiredDocuments.length > 0 && (
+              <p className="text-[12px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-3">
+                Missing: {record.missingRequiredDocuments.join(', ')}
+              </p>
+            )}
+            {docError && (
+              <p className="text-[12px] text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2 mb-3 break-words">
+                {docError}
+              </p>
+            )}
+            {record.documents.length === 0 ? (
+              <p className="text-[12.5px] text-muted-foreground">Nothing uploaded.</p>
+            ) : (
+              <ul className="space-y-1.5">
+                {record.documents.map((document) => (
+                  <li key={document.id} className="flex items-center gap-2.5 py-1.5">
+                    <FileText size={14} className="text-muted-foreground flex-shrink-0" />
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-[12.5px] text-main truncate">
+                        {document.typeDisplay ?? document.type ?? 'Document'}
+                      </span>
+                      <span className="block text-[11px] text-muted-foreground truncate">{document.fileName}</span>
+                    </span>
+                    {document.url && (
+                      <button
+                        onClick={() => void viewDocument(document.id, document.url!)}
+                        disabled={openingDoc === document.id}
+                        className="text-[11.5px] text-primary inline-flex items-center gap-1 flex-shrink-0 disabled:opacity-50"
+                      >
+                        {openingDoc === document.id ? (
+                          <Loader2 size={10} className="animate-spin" />
+                        ) : (
+                          <ExternalLink size={10} />
+                        )}
+                        View
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Card>
+
+          {record.contacts.length > 0 && (
+            <Card className="p-5 rounded-card border-surface card-shadow">
+              <SectionHeader title="Contacts" icon={Phone} count={record.contacts.length} />
+              <dl className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+                {record.contacts.map((contact, index) => (
+                  <Field
+                    key={contact.id ?? index}
+                    label={contact.role ?? 'Contact'}
+                    value={[contact.name, contact.phone].filter(Boolean).join(' · ')}
+                  />
+                ))}
+              </dl>
+            </Card>
+          )}
+        </div>
+
+        {/*
+          The decision sits first and sticks.
+
+          It used to be the last card in a long right-hand column, below Credit, SAP and
+          Business partner, so approving meant scrolling past everything on a page whose
+          only purpose is that one choice. Sticky rather than merely first, because the
+          reviewer reads the documents on the left and needs the buttons still in reach
+          when they get to the bottom of them.
+
+          `order-first` on the column puts it above the detail on a narrow screen too,
+          where the grid stacks and a sidebar would otherwise land underneath.
+        */}
+        <div className="space-y-4 order-first xl:order-none">
+          <div className="xl:sticky xl:top-4 xl:z-10">
+            <Card className="p-5 rounded-card border-surface card-shadow">
+              <SectionHeader title="Decision" icon={CheckCircle2} />
+
+              {decided ? (
+                <p className="text-[12.5px] text-muted-foreground">
+                  Already {record.status === 'Active' ? 'approved' : record.status.toLowerCase()}. No action left here.
+                </p>
+              ) : (
+                <>
+                  <p className="text-[12px] text-muted-foreground mb-3">
+                    Approving sends this depot to SAP. On success its code becomes the customer number SAP
+                    issues, and the current code moves to <span className="text-main">previous code</span>.
+                  </p>
+
+                  {(approve.isError || reject.isError) && (
+                    <p className="text-[12px] text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2 mb-3 break-words">
+                      {(approve.error ?? reject.error) instanceof Error
+                        ? ((approve.error ?? reject.error) as Error).message
+                        : 'The decision could not be saved.'}
+                    </p>
+                  )}
+
+                  <div className="flex gap-2">
+                    <button
+                      onClick={onApprove}
+                      disabled={busy}
+                      className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-emerald-600 text-white text-[12.5px] font-medium disabled:opacity-50"
+                    >
+                      {approve.isPending ? <Loader2 size={13} className="animate-spin" /> : <CheckCircle2 size={13} />}
+                      Approve
+                    </button>
+                    <button
+                      onClick={() => setShowReject((open) => !open)}
+                      disabled={busy}
+                      className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl border border-surface text-[12.5px] font-medium text-main disabled:opacity-50"
+                    >
+                      <XCircle size={13} /> Reject
+                    </button>
+                  </div>
+
+                  {showReject && (
+                    <div className="mt-3">
+                      <textarea
+                        value={rejectReason}
+                        onChange={(event) => setRejectReason(event.target.value)}
+                        rows={3}
+                        placeholder="Why is this being refused? The representative sees this."
+                        className="w-full text-[12.5px] rounded-xl border border-surface px-3 py-2 bg-transparent"
+                      />
+                      <button
+                        onClick={onReject}
+                        disabled={busy || rejectReason.trim().length < 3}
+                        className="mt-2 w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-rose-600 text-white text-[12.5px] font-medium disabled:opacity-50"
+                      >
+                        {reject.isPending ? <Loader2 size={13} className="animate-spin" /> : <XCircle size={13} />}
+                        Confirm rejection
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+            </Card>
+          </div>
+
+          <Card className="p-5 rounded-card border-surface card-shadow">
+            <SectionHeader title="Credit" icon={CreditCard} />
+            <dl className="grid grid-cols-2 gap-4">
+              <Field
+                label="Credit limit"
+                value={record.creditLimit != null ? record.creditLimit.toLocaleString() : null}
+              />
+              <Field label="Term (days)" value={record.creditTermDays} />
+              <Field label="Limit dated" value={when(record.creditLimitDate)} />
+              <Field label="Can trade" value={record.canTrade ? 'Yes' : 'No'} />
+            </dl>
+          </Card>
+
+          <Card className="p-5 rounded-card border-surface card-shadow">
+            <SectionHeader title="SAP" icon={Building2} />
+            <dl className="grid grid-cols-2 gap-4">
+              <Field label="Customer no." value={sapNumber} />
+              <Field label="Status" value={record.sapRegistration?.status} />
+              <Field label="Sales org" value={record.sap?.salesOrg} />
+              <Field label="Channel" value={record.sap?.distributionChannel} />
+              <Field label="Division" value={record.sap?.division} />
+              <Field label="Customer group" value={record.sap?.customerGroup} />
+              <Field label="Price group" value={record.sap?.priceGroup} />
+              <Field label="Payment terms" value={record.sap?.paymentTerms} />
+              <Field label="Sales office" value={record.sap?.salesOffice} />
+              <Field label="Sales group" value={record.sap?.salesGroup} />
+              <Field label="Tax number" value={record.sap?.taxNumber} />
+              <Field label="Attempts" value={record.sapRegistration?.attemptCount} />
+            </dl>
+          </Card>
+
+          {record.businessPartner && (
+            <Card className="p-5 rounded-card border-surface card-shadow">
+              <SectionHeader title="Business partner" icon={ShieldCheck} />
+              <dl className="grid grid-cols-2 gap-4">
+                <Field label="BP role" value={record.businessPartner.bpRole} />
+                <Field label="Account group" value={record.businessPartner.accountGroup} />
+                <Field label="Partner function" value={record.businessPartner.partnerFunction} />
+                <Field label="Personnel no." value={record.businessPartner.personnelNumber} />
+                <Field label="Search term 1" value={record.businessPartner.searchTerm1} />
+                <Field label="Search term 2" value={record.businessPartner.searchTerm2} />
+                <Field label="Tax type" value={record.businessPartner.taxType} />
+                <Field label="Tax class" value={record.businessPartner.taxClass} />
+              </dl>
+            </Card>
+          )}
+
+        </div>
+      </div>
+    </PageBody>
+  );
+}
